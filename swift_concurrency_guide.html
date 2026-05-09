@@ -1825,6 +1825,361 @@ thread.<span class="fn">start</span>()</pre>
 }</pre>
   </div>
 
+  <!-- ─────────────────────── DEEP DIVE SECTION ─────────────────────── -->
+
+  <h2>Deep Dive: Two Critical Questions About async let</h2>
+
+  <!-- QUESTION 1 -->
+  <h3>Q1 — Can you collect individual results as they arrive, or update incrementally?</h3>
+
+  <p>
+    <strong>No. <code>async let</code> does not stream results.</strong> Each binding is a future — a promise of a single value. You can only read it once, and only by awaiting it. You cannot observe partial progress, react as each one finishes, or process them in completion order.
+  </p>
+
+  <div class="callout danger">
+    <span class="callout-icon">🚫</span>
+    <div class="callout-content">
+      <h4>async let Has No "First to Finish" Semantic</h4>
+      <p>
+        With <code>async let</code>, even if API-A finishes in 0.1s and API-B takes 3s, you cannot act on API-A's result until you explicitly <code>await</code> it. And if you await API-B first, you sit idle for 3 seconds even though API-A's result is already sitting there, done.
+        <br/><br/>
+        <code>async let</code> is <em>parallel execution, serial collection.</em> The order you <code>await</code> them is the order you unblock — not the order they finish.
+      </p>
+    </div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header">
+      <div class="code-dots"><div class="code-dot dot-red"></div><div class="code-dot dot-yellow"></div><div class="code-dot dot-green"></div></div>
+      <span class="code-filename">AsyncLetOrdering.swift</span>
+      <span class="code-lang">Swift</span>
+    </div>
+    <pre><span class="cmt">// ── Scenario: API-A takes 0.5s, API-B takes 3s ──────────────────────────</span>
+
+<span class="kw">async let</span> fast = <span class="fn">fetchAPIa</span>()    <span class="cmt">// starts immediately — done in 0.5s</span>
+<span class="kw">async let</span> slow = <span class="fn">fetchAPIb</span>()    <span class="cmt">// starts immediately — done in 3s</span>
+
+<span class="cmt">// ❌ Case 1: You await slow FIRST</span>
+<span class="kw">let</span> b = <span class="kw">try await</span> slow          <span class="cmt">// blocks here for 3 full seconds</span>
+<span class="kw">let</span> a = <span class="kw">try await</span> fast          <span class="cmt">// fast was ready 2.5s ago — we just wasted time</span>
+<span class="fn">updateUI</span>(a: a, b: b)            <span class="cmt">// UI updates only at t=3s</span>
+
+<span class="cmt">// ❌ Case 2: You want to update UI with fast result immediately</span>
+<span class="kw">let</span> a = <span class="kw">try await</span> fast          <span class="cmt">// unblocks at t=0.5s ✓</span>
+<span class="fn">updateUIWithPartialData</span>(a)       <span class="cmt">// ← this is VALID syntax, but...</span>
+<span class="kw">let</span> b = <span class="kw">try await</span> slow          <span class="cmt">// ...slow was already running in parallel all along</span>
+<span class="fn">updateUIWithFullData</span>(a: a, b: b) <span class="cmt">// unblocks at t=3s</span>
+<span class="cmt">// This DOES work — but only if you know which one is faster at compile time!</span>
+<span class="cmt">// In real apps the order varies per network condition — not reliable.</span>
+
+<span class="cmt">// ✅ Awaiting individually IS valid for simple "known order" cases:</span>
+<span class="kw">async let</span> profileImage = <span class="fn">fetchAvatar</span>()
+<span class="kw">async let</span> profileData  = <span class="fn">fetchProfile</span>()   <span class="cmt">// both run in parallel</span>
+<span class="kw">let</span> data = <span class="kw">try await</span> profileData           <span class="cmt">// show skeleton → data first</span>
+<span class="fn">showProfile</span>(data)                           <span class="cmt">// partial UI update ✓</span>
+<span class="kw">let</span> image = <span class="kw">try await</span> profileImage          <span class="cmt">// then image when ready</span>
+<span class="fn">showAvatar</span>(image)                           <span class="cmt">// complete UI update ✓</span></pre>
+  </div>
+
+  <h3>When You Actually Need "First to Finish / Incremental Updates" — Use TaskGroup</h3>
+
+  <p>
+    <code>TaskGroup</code> iterates results in <em>completion order</em> — whichever child task finishes first is the first value you receive in the <code>for await</code> loop. This is the right tool when you want to update UI progressively or act on each result as it arrives.
+  </p>
+
+  <div class="code-block">
+    <div class="code-header">
+      <div class="code-dots"><div class="code-dot dot-red"></div><div class="code-dot dot-yellow"></div><div class="code-dot dot-green"></div></div>
+      <span class="code-filename">TaskGroupStreaming.swift</span>
+      <span class="code-lang">Swift</span>
+    </div>
+    <pre><span class="cmt">// ── TaskGroup: process each result the moment it arrives ──────────────────</span>
+<span class="kw">func</span> <span class="fn">loadDashboardProgressively</span>() <span class="kw">async throws</span> {
+    <span class="kw">try await</span> <span class="fn">withThrowingTaskGroup</span>(of: <span class="tp">DashboardSection</span>.<span class="kw">self</span>) { group <span class="kw">in</span>
+
+        group.<span class="fn">addTask</span> { .<span class="fn">profile</span>(<span class="kw">try await</span> <span class="fn">fetchProfile</span>()) }    <span class="cmt">// 0.3s</span>
+        group.<span class="fn">addTask</span> { .<span class="fn">feed</span>(<span class="kw">try await</span> <span class="fn">fetchFeed</span>()) }          <span class="cmt">// 1.2s</span>
+        group.<span class="fn">addTask</span> { .<span class="fn">ads</span>(<span class="kw">try await</span> <span class="fn">fetchAds</span>()) }            <span class="cmt">// 2.5s</span>
+
+        <span class="cmt">// Results arrive in COMPLETION ORDER — not the order added above</span>
+        <span class="kw">for try await</span> section <span class="kw">in</span> group {
+            <span class="kw">switch</span> section {
+            <span class="kw">case</span> .<span class="fn">profile</span>(<span class="kw">let</span> p): <span class="kw">await</span> <span class="fn">showProfile</span>(p)    <span class="cmt">// fires at t=0.3s ✓</span>
+            <span class="kw">case</span> .<span class="fn">feed</span>(<span class="kw">let</span> f):    <span class="kw">await</span> <span class="fn">showFeed</span>(f)       <span class="cmt">// fires at t=1.2s ✓</span>
+            <span class="kw">case</span> .<span class="fn">ads</span>(<span class="kw">let</span> a):     <span class="kw">await</span> <span class="fn">showAds</span>(a)        <span class="cmt">// fires at t=2.5s ✓</span>
+            }
+            <span class="cmt">// Each case updates the UI immediately when its data is ready</span>
+        }
+    }
+}
+
+<span class="cmt">// ── async let version: ALL sections only shown at t=2.5s (slowest) ────────</span>
+<span class="kw">func</span> <span class="fn">loadDashboardAllAtOnce</span>() <span class="kw">async throws</span> {
+    <span class="kw">async let</span> profile = <span class="fn">fetchProfile</span>()   <span class="cmt">// 0.3s — waits in silence</span>
+    <span class="kw">async let</span> feed    = <span class="fn">fetchFeed</span>()       <span class="cmt">// 1.2s — waits in silence</span>
+    <span class="kw">async let</span> ads     = <span class="fn">fetchAds</span>()         <span class="cmt">// 2.5s — bottleneck</span>
+    <span class="kw">let</span> (p, f, a) = <span class="kw">try await</span> (profile, feed, ads)
+    <span class="fn">showAll</span>(p, f, a)   <span class="cmt">// UI only updates at t=2.5s — no progressive loading</span>
+}</pre>
+  </div>
+
+  <div class="comparison-table-wrapper" style="margin: 24px 0 32px;">
+    <table class="comparison-table">
+      <tr>
+        <th>Capability</th>
+        <th>async let</th>
+        <th>TaskGroup</th>
+      </tr>
+      <tr>
+        <td>Runs tasks in parallel</td>
+        <td class="good">Yes</td>
+        <td class="good">Yes</td>
+      </tr>
+      <tr>
+        <td>Fixed number of tasks at compile time</td>
+        <td class="good">Yes (preferred)</td>
+        <td class="warn">Possible but verbose</td>
+      </tr>
+      <tr>
+        <td>Dynamic number of tasks at runtime</td>
+        <td class="bad">No</td>
+        <td class="good">Yes (its strength)</td>
+      </tr>
+      <tr>
+        <td>Process results in completion order</td>
+        <td class="bad">No — await order only</td>
+        <td class="good">Yes — for await loop</td>
+      </tr>
+      <tr>
+        <td>Incremental / progressive UI updates</td>
+        <td class="warn">Only if you know fastest first</td>
+        <td class="good">Yes — native</td>
+      </tr>
+      <tr>
+        <td>Cancel all if one fails</td>
+        <td class="good">Automatic</td>
+        <td class="good">Automatic (throwing variant)</td>
+      </tr>
+      <tr>
+        <td>Cancel some, keep others</td>
+        <td class="bad">No</td>
+        <td class="good">Yes — group.cancelAll()</td>
+      </tr>
+      <tr>
+        <td>Collect partial results before error</td>
+        <td class="bad">No</td>
+        <td class="good">Yes — iterate before failure</td>
+      </tr>
+    </table>
+  </div>
+
+  <!-- QUESTION 2 -->
+  <h3>Q2 — What happens if one of the async let tasks throws?</h3>
+
+  <p>
+    This is one of the most important behaviors to understand. The rules are precise and were deliberately designed this way:
+  </p>
+
+  <div class="callout warning">
+    <span class="callout-icon">⚙️</span>
+    <div class="callout-content">
+      <h4>The Three-Phase Error Rule for async let</h4>
+      <p>
+        <strong>Phase 1 — Tasks run in parallel.</strong> Both tasks execute concurrently. If one throws, it does not immediately stop the other — the error is stored and held.<br/><br/>
+        <strong>Phase 2 — Error surfaces at the await point.</strong> The error is only thrown when you attempt to <code>await</code> the binding that failed. Code between the <code>async let</code> declaration and the <code>await</code> continues normally.<br/><br/>
+        <strong>Phase 3 — Other bindings are automatically cancelled.</strong> When the error propagates out of the scope (i.e., the function throws), Swift automatically cancels any <code>async let</code> bindings that haven't been awaited yet and waits for them to finish cancelling before the scope exits.
+      </p>
+    </div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header">
+      <div class="code-dots"><div class="code-dot dot-red"></div><div class="code-dot dot-yellow"></div><div class="code-dot dot-green"></div></div>
+      <span class="code-filename">AsyncLetErrorHandling.swift</span>
+      <span class="code-lang">Swift</span>
+    </div>
+    <pre><span class="cmt">// ── Scenario A: One throws, you await the throwing one first ──────────────</span>
+<span class="kw">func</span> <span class="fn">loadDashboard</span>() <span class="kw">async throws</span> -> <span class="tp">Dashboard</span> {
+    <span class="kw">async let</span> user  = <span class="fn">fetchUser</span>()           <span class="cmt">// ← will throw NetworkError</span>
+    <span class="kw">async let</span> posts = <span class="fn">fetchPosts</span>()          <span class="cmt">// ← will succeed</span>
+    <span class="cmt">// Both tasks are running in parallel right now</span>
+
+    <span class="kw">let</span> u = <span class="kw">try await</span> user    <span class="cmt">// ← throws NetworkError here</span>
+    <span class="cmt">// Execution stops. The `posts` child task is CANCELLED automatically.</span>
+    <span class="cmt">// Swift awaits posts cancellation, then propagates the error to the caller.</span>
+    <span class="kw">let</span> p = <span class="kw">try await</span> posts   <span class="cmt">// ← NEVER REACHED</span>
+    <span class="kw">return</span> <span class="tp">Dashboard</span>(user: u, posts: p)
+}
+<span class="cmt">// Caller receives: throw NetworkError</span>
+
+<span class="cmt">// ── Scenario B: One throws, you await the NON-throwing one first ──────────</span>
+<span class="kw">func</span> <span class="fn">loadDashboardB</span>() <span class="kw">async throws</span> -> <span class="tp">Dashboard</span> {
+    <span class="kw">async let</span> user  = <span class="fn">fetchUser</span>()           <span class="cmt">// ← will throw NetworkError</span>
+    <span class="kw">async let</span> posts = <span class="fn">fetchPosts</span>()          <span class="cmt">// ← will succeed</span>
+
+    <span class="kw">let</span> p = <span class="kw">try await</span> posts   <span class="cmt">// ← succeeds, returns [Post]</span>
+    <span class="cmt">// posts result is in hand. user task may have ALREADY thrown by now,</span>
+    <span class="cmt">// but the error is held — not yet surfaced.</span>
+    <span class="kw">let</span> u = <span class="kw">try await</span> user    <span class="cmt">// ← throws NetworkError HERE (error surfaces now)</span>
+    <span class="cmt">// `p` was fetched and computed, but it's DISCARDED — function throws anyway.</span>
+    <span class="kw">return</span> <span class="tp">Dashboard</span>(user: u, posts: p)
+}
+<span class="cmt">// posts work was wasted. NetworkError is thrown. p is gone.</span>
+
+<span class="cmt">// ── Scenario C: BOTH throw ────────────────────────────────────────────────</span>
+<span class="kw">func</span> <span class="fn">loadDashboardC</span>() <span class="kw">async throws</span> -> <span class="tp">Dashboard</span> {
+    <span class="kw">async let</span> user  = <span class="fn">fetchUser</span>()           <span class="cmt">// ← throws NetworkError.timeout</span>
+    <span class="kw">async let</span> posts = <span class="fn">fetchPosts</span>()          <span class="cmt">// ← throws NetworkError.serverError</span>
+
+    <span class="kw">let</span> u = <span class="kw">try await</span> user    <span class="cmt">// ← throws NetworkError.timeout</span>
+    <span class="cmt">// posts is cancelled. NetworkError.timeout propagates.</span>
+    <span class="cmt">// NetworkError.serverError from posts is SILENTLY DROPPED.</span>
+    <span class="kw">let</span> p = <span class="kw">try await</span> posts   <span class="cmt">// NEVER REACHED</span>
+    <span class="kw">return</span> <span class="tp">Dashboard</span>(user: u, posts: p)
+}
+<span class="cmt">// Only FIRST awaited error is thrown. The other error is lost.</span></pre>
+  </div>
+
+  <div class="callout danger">
+    <span class="callout-icon">☠️</span>
+    <div class="callout-content">
+      <h4>Critical: When Both Throw, Only One Error Survives</h4>
+      <p>
+        If both <code>async let</code> bindings throw, you only get the error from the one you <code>await</code> first. The other error is silently discarded. There is no mechanism in <code>async let</code> to collect multiple errors simultaneously. If you need to know about all failures, use <code>TaskGroup</code> with manual error collection.
+      </p>
+    </div>
+  </div>
+
+  <div class="code-block">
+    <div class="code-header">
+      <div class="code-dots"><div class="code-dot dot-red"></div><div class="code-dot dot-yellow"></div><div class="code-dot dot-green"></div></div>
+      <span class="code-filename">AsyncLetErrorStrategies.swift</span>
+      <span class="code-lang">Swift</span>
+    </div>
+    <pre><span class="cmt">// ── Strategy 1: Make errors optional — tolerate individual failures ────────</span>
+<span class="kw">func</span> <span class="fn">loadDashboardTolerant</span>() <span class="kw">async</span> -> <span class="tp">Dashboard</span> {
+    <span class="kw">async let</span> user  = <span class="kw">try</span>? <span class="fn">fetchUser</span>()      <span class="cmt">// User?  — nil on failure</span>
+    <span class="kw">async let</span> posts = <span class="kw">try</span>? <span class="fn">fetchPosts</span>()     <span class="cmt">// [Post]? — nil on failure</span>
+    <span class="kw">async let</span> ads   = <span class="kw">try</span>? <span class="fn">fetchAds</span>()       <span class="cmt">// [Ad]?   — nil on failure</span>
+
+    <span class="cmt">// None of these can throw — all errors converted to nil</span>
+    <span class="kw">return await</span> <span class="tp">Dashboard</span>(
+        user:  user  ?? .<span class="prop">guest</span>,
+        posts: posts ?? [],
+        ads:   ads   ?? []
+    )
+    <span class="cmt">// If fetchUser fails, show guest profile. Other sections still load.</span>
+    <span class="cmt">// ✅ Resilient: partial success is useful and shown to the user.</span>
+}
+
+<span class="cmt">// ── Strategy 2: Provide fallback values inline ────────────────────────────</span>
+<span class="kw">async let</span> config = (<span class="kw">try</span>? <span class="fn">fetchRemoteConfig</span>()) ?? <span class="tp">Config</span>.<span class="prop">default</span>
+<span class="kw">async let</span> flags  = (<span class="kw">try</span>? <span class="fn">fetchFeatureFlags</span>()) ?? []
+<span class="kw">let</span> (c, f) = <span class="kw">await</span> (config, flags)   <span class="cmt">// never throws, always has values</span>
+
+<span class="cmt">// ── Strategy 3: Collect ALL errors — use TaskGroup instead ───────────────</span>
+<span class="kw">func</span> <span class="fn">loadWithAllErrors</span>() <span class="kw">async</span> -> (<span class="tp">Dashboard</span>?, [<span class="tp">Error</span>]) {
+    <span class="kw">var</span> errors: [<span class="tp">Error</span>] = []
+    <span class="kw">var</span> user: <span class="tp">User</span>?
+    <span class="kw">var</span> posts: [<span class="tp">Post</span>]?
+
+    <span class="kw">await</span> <span class="fn">withTaskGroup</span>(of: <span class="tp">Void</span>.<span class="kw">self</span>) { group <span class="kw">in</span>
+        group.<span class="fn">addTask</span> {
+            <span class="kw">do</span>    { user  = <span class="kw">try await</span> <span class="fn">fetchUser</span>() }
+            <span class="kw">catch</span> { errors.<span class="fn">append</span>(error) }          <span class="cmt">// capture, don't throw</span>
+        }
+        group.<span class="fn">addTask</span> {
+            <span class="kw">do</span>    { posts = <span class="kw">try await</span> <span class="fn">fetchPosts</span>() }
+            <span class="kw">catch</span> { errors.<span class="fn">append</span>(error) }
+        }
+        <span class="kw">await</span> group.<span class="fn">waitForAll</span>()   <span class="cmt">// non-throwing — errors are already captured</span>
+    }
+    <span class="kw">guard</span> errors.<span class="prop">isEmpty</span>, <span class="kw">let</span> u = user, <span class="kw">let</span> p = posts <span class="kw">else</span> {
+        <span class="kw">return</span> (<span class="kw">nil</span>, errors)   <span class="cmt">// return ALL errors to caller</span>
+    }
+    <span class="kw">return</span> (<span class="tp">Dashboard</span>(user: u, posts: p), [])
+}
+
+<span class="cmt">// ── Strategy 4: Timeout a single async let ────────────────────────────────</span>
+<span class="kw">func</span> <span class="fn">fetchWithTimeout</span>() <span class="kw">async throws</span> -> <span class="tp">Data</span> {
+    <span class="kw">async let</span> data    = <span class="fn">fetchData</span>()
+    <span class="kw">async let</span> timeout: <span class="tp">Void</span> = {
+        <span class="kw">try await</span> <span class="tp">Task</span>.<span class="fn">sleep</span>(for: .<span class="fn">seconds</span>(<span class="num">5</span>))
+        <span class="kw">throw</span> <span class="tp">TimeoutError</span>()
+    }()
+
+    <span class="cmt">// Race: whichever throws or returns first wins</span>
+    <span class="kw">do</span> {
+        <span class="kw">let</span> result = <span class="kw">try await</span> data
+        <span class="kw">return</span> result     <span class="cmt">// data won — timeout child task is cancelled</span>
+    } <span class="kw">catch is</span> <span class="tp">TimeoutError</span> {
+        <span class="kw">throw</span> <span class="tp">TimeoutError</span>()   <span class="cmt">// timeout won — data child task is cancelled</span>
+    }
+}</pre>
+  </div>
+
+  <h3>The Complete Error Behaviour Matrix</h3>
+
+  <table class="comparison-table">
+    <tr>
+      <th>Scenario</th>
+      <th>What Actually Happens</th>
+      <th>What Caller Sees</th>
+    </tr>
+    <tr>
+      <td>A throws, B succeeds — await A first</td>
+      <td>A's error surfaces immediately. B is cancelled. B's result is discarded.</td>
+      <td class="bad">A's error thrown</td>
+    </tr>
+    <tr>
+      <td>A throws, B succeeds — await B first</td>
+      <td>B succeeds and result is in hand. Then awaiting A surfaces its error. B's result is discarded.</td>
+      <td class="bad">A's error thrown (B's work wasted)</td>
+    </tr>
+    <tr>
+      <td>Both throw — await A first</td>
+      <td>A's error surfaces. B is cancelled. B's error is silently dropped.</td>
+      <td class="bad">Only A's error. B's error lost.</td>
+    </tr>
+    <tr>
+      <td>Both throw — await B first</td>
+      <td>B's error surfaces. A is cancelled. A's error is silently dropped.</td>
+      <td class="bad">Only B's error. A's error lost.</td>
+    </tr>
+    <tr>
+      <td>Neither throws</td>
+      <td>Both complete. Results available when awaited.</td>
+      <td class="good">Both results returned</td>
+    </tr>
+    <tr>
+      <td>A throws, use <code>try?</code> on A</td>
+      <td>A's error is converted to nil. B continues unaffected.</td>
+      <td class="good">nil for A, B's result — no throw</td>
+    </tr>
+    <tr>
+      <td>A throws, use <code>try?</code> on both</td>
+      <td>Both errors become nil. No throwing, no cancellation.</td>
+      <td class="good">Both results as optionals</td>
+    </tr>
+    <tr>
+      <td>A throws, Task is cancelled externally</td>
+      <td>CancellationError surfaces. All async let tasks are cancelled.</td>
+      <td class="bad">CancellationError thrown</td>
+    </tr>
+  </table>
+
+  <div class="callout tip">
+    <span class="callout-icon">💡</span>
+    <div class="callout-content">
+      <h4>Design Rule of Thumb</h4>
+      <p>
+        Use <strong><code>try await</code></strong> (throwing) on an <code>async let</code> only when <em>all-or-nothing</em> is the correct semantic — if any one piece fails, the whole operation should fail.<br/><br/>
+        Use <strong><code>try?</code> or <code>try? ... ?? default</code></strong> when the piece is optional or has a sensible fallback — partial results are still useful to the user.<br/><br/>
+        Use <strong><code>TaskGroup</code> with manual error collection</strong> when you need to report multiple failures simultaneously (e.g., a batch validation screen listing all errors at once).
+      </p>
+    </div>
+  </div>
+
 </div>
 
 <!-- ============================================================ CHAPTER 8 ============================================================ -->
